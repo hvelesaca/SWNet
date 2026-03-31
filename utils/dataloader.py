@@ -54,8 +54,8 @@ class CODataset(data.Dataset):
 
         # Contar imágenes originales
         original_images = [f for f in os.listdir(image_root) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
-        original_gts = [f for f in os.listdir(gt_root) if f.lower().endswith(('.jpg', '.png', '.jpeg', '.tif'))]
-        original_thermals = [f for f in os.listdir(thermal_root) if f.lower().endswith(('.jpg', '.png', '.jpeg', '.tif'))]
+        original_gts = [f for f in os.listdir(gt_root) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+        original_thermals = [f for f in os.listdir(thermal_root) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
 
         print(f"📊 ESTADÍSTICAS DEL DATASET:")
         print(f" • Imágenes RGB encontradas: {len(original_images)}")
