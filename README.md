@@ -8,7 +8,7 @@ Overall proposed architecture.
 
 
 # Citation
-Please cite those paper if you find helpful,
+If you use the SWNet, please cite the following paper
 ```
  @inproceedings{velesaca2026swnet,
   title={SWNet: A Cross-Spectral Network for Camouflaged Weed Detection},
