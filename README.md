@@ -1,4 +1,4 @@
-# AVNet-v2
+# SWNet
 
 # Architecture
 Overall proposed architecture.
