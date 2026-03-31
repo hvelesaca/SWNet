@@ -61,9 +61,9 @@ def main():
     for idx in range(1,201):    
         parser = argparse.ArgumentParser()
         parser.add_argument('--testsize', type=int, default=416, help='testing size (debe coincidir con train)')
-        parser.add_argument('--pth_path', type=str, default=f'C:/Respaldo/Henry/Proyecto Camuflaje/Codigo/AGNet-main/model_pth/AGNet_IguanaDataset/{idx}_AGNet-PVT.pth')
-        parser.add_argument('--dataset', type=str, default='M3FD')
-        parser.add_argument('--test_path', type=str, default='../../Datasets', help='raíz de datasets (coincidir mayúsculas/minúsculas)')
+        parser.add_argument('--pth_path', type=str, default=f'C:/Respaldo/Henry/Proyecto Camuflaje/Codigo/AVNet-v2-main/model_pth/AVNet-v2_WeedBanana_RGB-NIR/{idx}_AVNet-v2-PVT.pth')
+        parser.add_argument('--dataset', type=str, default='WeedBanana_RGB-NIR')
+        parser.add_argument('--data_root', type=str, default='../../Datasets', help='raíz de datasets (coincidir mayúsculas/minúsculas)')
         parser.add_argument('--save_vis', action='store_true', default=True, help='guardar grid RGB|Thermal|GT|Pred')
         parser.add_argument('--vis_subdir', type=str, default='vis', help='subcarpeta para guardar visualizaciones')
         args = parser.parse_args()
@@ -81,7 +81,7 @@ def main():
         
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        data_path = os.path.join(args.test_path, 'test')
+        data_path = os.path.join(args.data_root, args.dataset, 'test')
         save_dir_root = f'./results_/{os.path.basename(os.path.dirname(args.pth_path))}_{idx}/{args.dataset}'
         os.makedirs(save_dir_root, exist_ok=True)
         if args.save_vis:
@@ -101,7 +101,7 @@ def main():
         # Rutas de test
         image_root = os.path.join(data_path, 'Imgs') + '/'
         gt_root = os.path.join(data_path, 'GT') + '/'
-        thermal_root = os.path.join(data_path, 'Thermal') + '/'
+        thermal_root = os.path.join(data_path, 'NIR') + '/'
         print('Test roots:', image_root, gt_root, thermal_root)
 
         # Dataset de test: debe devolver (image, thermal, gt, name)
@@ -123,7 +123,7 @@ def main():
                 gt = gt.to(device, non_blocking=True)
 
                 # Forward
-                outs_list, out_single = model(image, thermal)
+                outs_list, out_single,_ = model(image, thermal)
 
                 # Reescalar a tamaño de GT
                 target_size = gt.shape[-2:]
@@ -170,13 +170,6 @@ def main():
                 SM.step(pred=pred_np, gt=gt_np)  
                 EM.step(pred=pred_np, gt=gt_np)  
                 M.step(pred=pred_np, gt=gt_np)  
-
-                # Obtener resultados para la imagen actual  
-                #fm = FM.get_results()["fm"]  
-                #wfm = WFM.get_results()["wfm"]  
-                #sm = SM.get_results()["sm"]  
-                #em = EM.get_results()["em"]  
-                #mae = M.get_results()["mae"]  
                 
                 
                 # Visualización opcional
@@ -212,7 +205,7 @@ def main():
         print(results) 
         
         
-        with open("C:/Respaldo/Henry/Proyecto Camuflaje/Codigo/AGNet-main/evalresults.txt", "a") as file:  
+        with open("C:/Respaldo/Henry/Proyecto Camuflaje/Codigo/AVNet-v2-main/evalresults.txt", "a") as file:  
             file.write(f"{idx}_AGNet-PVT {str(results)}\n")  
 
 

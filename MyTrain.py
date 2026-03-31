@@ -18,6 +18,10 @@ import torch.nn.functional as F
 
 from py_sod_metrics import MAE, Emeasure, Fmeasure, Smeasure, WeightedFmeasure  
 
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
 # =========================
 # Utilidades de pérdidas
 # =========================
@@ -33,7 +37,38 @@ def structure_loss(pred, mask):
 
     return (wbce + wiou).mean()
 
+# =========================
+# EDGE LOSS (NUEVO)
+# =========================
+def get_edge_gt(mask):
+    # Genera bordes rápidamente en GPU
+    max_pool = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+    min_pool = -F.max_pool2d(-mask, kernel_size=3, stride=1, padding=1)
+    edge = max_pool - min_pool
+    return edge.clamp(0, 1)
 
+def edge_loss(pred_edges, gt_mask):
+    """
+    pred_edges: puede ser un Tensor o una Lista de Tensores
+    gt_mask: Tensor [B, 1, H, W]
+    """
+    gt_edge = get_edge_gt(gt_mask)
+    
+    # Si recibimos una lista (supervisión profunda), iteramos
+    if isinstance(pred_edges, (list, tuple)):
+        loss = 0
+        for pred in pred_edges:
+            # Reescalar predicción al tamaño del GT si es necesario
+            if pred.shape[2:] != gt_edge.shape[2:]:
+                pred = F.interpolate(pred, size=gt_edge.shape[2:], mode='bilinear', align_corners=False)
+            loss += F.binary_cross_entropy_with_logits(pred, gt_edge)
+        return loss / len(pred_edges)
+    else:
+        # Caso de un solo tensor
+        if pred_edges.shape[2:] != gt_edge.shape[2:]:
+            pred_edges = F.interpolate(pred_edges, size=gt_edge.shape[2:], mode='bilinear', align_corners=False)
+        return F.binary_cross_entropy_with_logits(pred_edges, gt_edge)
+        
 # =========================
 # Visualización (TensorBoard)
 # =========================
@@ -49,7 +84,7 @@ def denorm(img, mean, std):
     x = img * std + mean
     return x.clamp(0.0, 1.0)
 
-def log_train_images(writer, step, images, thermals, gts, preds,
+def log_train_images(writer, step, images, thermals, gts, preds, spectrum,
                      rgb_stats=((0.485,0.456,0.406),(0.229,0.224,0.225)),
                      th_stats=((0.5,0.5,0.5),(0.5,0.5,0.5))):
     """
@@ -71,11 +106,11 @@ def log_train_images(writer, step, images, thermals, gts, preds,
         grid_pr = vutils.make_grid(pr_vis, nrow=4)
 
         writer.add_image('train/RGB', grid_img, global_step=step)
-        writer.add_image('train/NIR', grid_th, global_step=step)
+        writer.add_image(f'train/{spectrum}', grid_th, global_step=step)
         writer.add_image('train/GT', grid_gt, global_step=step)
         writer.add_image('train/Pred', grid_pr, global_step=step)
 
-def log_val_images(writer, epoch, image, thermal, gt, pred,
+def log_val_images(writer, epoch, image, thermal, gt, pred, spectrum,
                    rgb_stats=((0.485,0.456,0.406),(0.229,0.224,0.225)),
                    th_stats=((0.5,0.5,0.5),(0.5,0.5,0.5))):
     """
@@ -85,7 +120,7 @@ def log_val_images(writer, epoch, image, thermal, gt, pred,
     img_vis = denorm(image, *rgb_stats)
     th_vis = denorm(thermal, *th_stats)
     writer.add_image('val/RGB', img_vis[0], global_step=epoch)
-    writer.add_image('val/NIR', th_vis[0], global_step=epoch)
+    writer.add_image(f'val/{spectrum}', th_vis[0], global_step=epoch)
     writer.add_image('val/GT', gt[0], global_step=epoch)
     writer.add_image('val/Pred', pred[0], global_step=epoch)
 
@@ -119,9 +154,9 @@ def val(model, epoch, save_path, writer, opt, device):
 
     # test_dataset debe devolver tensores: image:1x3xHxW, thermal:1x3xHxW, gt:1x1xHxW
     test_data = test_dataset(
-        image_root=os.path.join(opt.val_path, 'Imgs') + '/',
-        thermal_root=os.path.join(opt.val_path, 'NIR') + '/',
-        gt_root=os.path.join(opt.val_path, 'GT') + '/',
+        image_root=os.path.join(opt.test_path, 'Imgs') + '/',
+        thermal_root=os.path.join(opt.test_path, f'{opt.spectrum}') + '/',
+        gt_root=os.path.join(opt.test_path, 'GT') + '/',
         testsize=opt.trainsize
     )
 
@@ -133,7 +168,7 @@ def val(model, epoch, save_path, writer, opt, device):
         gt_t = gt.to(device, non_blocking=True)
 
         # forward
-        res_list, res_single = model(image, thermal)  # asumiendo tu modelo devuelve (list, tensor)
+        res_list, res_single, _ = model(image, thermal)  # asumiendo tu modelo devuelve (list, tensor)
 
         # upsample todas las salidas a la resolución de gt
         target_size = gt_t.shape[-2:]
@@ -167,7 +202,7 @@ def val(model, epoch, save_path, writer, opt, device):
             
         # Log visualización para la primera imagen
         if i == 0:
-            log_val_images(writer, epoch, image, thermal, gt_t, pred)    
+            log_val_images(writer, epoch, image, thermal, gt_t, pred, opt.spectrum)    
             
         # Obtener resultados de las métricas
         metrics_results = {}
@@ -211,7 +246,7 @@ def val(model, epoch, save_path, writer, opt, device):
 
         # Log visualización para la primera imagen
         if i == 0:
-            log_val_images(writer, epoch, image, thermal, gt_t, pred)
+            log_val_images(writer, epoch, image, thermal, gt_t, pred, opt.spectrum)
 
     mae = mae_sum / max(1, test_data.size)
     writer.add_scalar('val/MAE', mae, global_step=epoch)
@@ -246,6 +281,7 @@ def train(train_loader, model, optimizer, epoch, total_step, writer, device, opt
     size_rates = [1]
     loss_P1_record = AvgMeter()
     loss_P2_record = AvgMeter()
+    loss_edge_record = AvgMeter()
 
     global_step = (epoch - 1) * total_step
 
@@ -268,7 +304,7 @@ def train(train_loader, model, optimizer, epoch, total_step, writer, device, opt
                 gts = F.interpolate(gts, size=(trainsize, trainsize), mode='nearest')
 
             # ---- forward ----
-            P1, P2 = model(images, thermals)  # P1: lista de predicciones, P2: pred principal
+            P1, P2, edge_pred = model(images, thermals)
 
             # ---- loss function ----            
             #LOSS P1
@@ -283,7 +319,11 @@ def train(train_loader, model, optimizer, epoch, total_step, writer, device, opt
             
             #LOSS P2
             loss_P2 = structure_loss(P2, gts)
-            loss = loss_P1 + loss_P2
+            
+            loss_edge = edge_loss(edge_pred, gts)
+            lambda_edge = 0.75
+            
+            loss = loss_P1 + loss_P2 + lambda_edge * loss_edge
                         
             # ---- backward ----
             loss.backward()
@@ -294,13 +334,15 @@ def train(train_loader, model, optimizer, epoch, total_step, writer, device, opt
             if rate == 1:
                 loss_P1_record.update(loss_P1.detach(), images.size(0))
                 loss_P2_record.update(loss_P2.detach(), images.size(0))
+                loss_edge_record.update(loss_edge.detach(), images.size(0))
+
 
         # ---- logging texto ----
         if i % 20 == 0 or i == total_step:
             msg = ('{} Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], '
-                   'Loss P1: [{:.4f}], Loss P2: [{:.4f}]').format(
+                   'Loss P1: [{:.4f}], Loss P2: [{:.4f}], Loss Edge: [{:.4f}]').format(
                 datetime.now(), epoch, opt.epoch, i, total_step,
-                loss_P1_record.show(), loss_P2_record.show())
+                loss_P1_record.show(), loss_P2_record.show(), loss_edge_record.show())
             print(msg)
             logging.info(msg)
 
@@ -312,13 +354,13 @@ def train(train_loader, model, optimizer, epoch, total_step, writer, device, opt
                 pred_vis = P2
                 pred_vis = torch.sigmoid(pred_vis)
                 pred_vis = pred_vis.clamp(0, 1)
-                log_train_images(writer, global_step, images, thermals, gts, pred_vis,
+                log_train_images(writer, global_step, images, thermals, gts, pred_vis, opt.spectrum,
                                  rgb_stats=rgb_stats, th_stats=th_stats)
 
     # guardado periódico
     save_path = opt.save_path
     if epoch % opt.epoch_save == 0:
-        torch.save(model.state_dict(), os.path.join(save_path, f'{epoch}_AGNet-PVT.pth'))
+        torch.save(model.state_dict(), os.path.join(save_path, f'{epoch}_AVNet-v2-PVT.pth'))
 
 
 # =========================
@@ -338,26 +380,27 @@ def load_matched_state_dict(model, state_dict, print_stats=True):
 
 
 if __name__ == '__main__':
-    dataset = 'M3fd6'
-    #dataset = 'IguanaDataset'
+    #dataset = 'M3fd6'
+    dataset = 'WeedBanana'
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--epoch', type=int, default=200, help='epoch number')
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
-    #parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
     parser.add_argument('--optimizer', type=str, default='AdamW', help='AdamW or SGD')
     parser.add_argument('--augmentation', default=True, help='random flip/rotation etc.')
-    parser.add_argument('--batchsize', type=int, default=8, help='training batch size')
-    parser.add_argument('--trainsize', type=int, default=385, help='training image size (e.g., 352,704,1056)')
+    parser.add_argument('--batchsize', type=int, default=10, help='training batch size')
+    parser.add_argument('--trainsize', type=int, default=416, help='training image size (e.g., 352,704,1056)')
     parser.add_argument('--clip', type=float, default=1.0, help='gradient clipping margin')
     parser.add_argument('--load', type=str, default=None, help='checkpoint path to load')
     parser.add_argument('--decay_rate', type=float, default=0.1, help='lr decay rate')
     parser.add_argument('--decay_epoch', type=int, default=100, help='lr decay every n epochs')
     parser.add_argument('--train_path', type=str, default=f'../../Datasets/{dataset}/train', help='train dataset path')
-    parser.add_argument('--val_path', type=str, default=f'../../Datasets/{dataset}/val', help='val dataset path')
-    parser.add_argument('--save_path', type=str, default=f'./model_pth/AGNet_{dataset}/')
+    parser.add_argument('--test_path', type=str, default=f'../../Datasets/{dataset}/val', help='val dataset path')
+    parser.add_argument('--save_path', type=str, default=f'./model_pth/AVNet-v2_{dataset}/')
     parser.add_argument('--epoch_save', type=int, default=1, help='save every n epochs')
     parser.add_argument('--log_every', type=int, default=5, help='steps between train visual logs')
+    parser.add_argument('--spectrum', type=str, default='NIR', help='Thermal or NIR')
+    
     
     # Banderas para métricas de evaluación
     parser.add_argument('--use_mae', action='store_true', default=True, help='use MAE metric')
@@ -397,7 +440,7 @@ if __name__ == '__main__':
 
     image_root = f'{opt.train_path}/Imgs/'
     gt_root = f'{opt.train_path}/GT/'
-    thermal_root = f'{opt.train_path}/NIR/'
+    thermal_root = f'{opt.train_path}/{opt.spectrum}/'
 
     print("image_root: ", image_root)
     print("gt_root: ", gt_root)

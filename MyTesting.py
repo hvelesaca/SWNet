@@ -6,7 +6,7 @@ import numpy as np
 import cv2
 from datetime import datetime
 
-from utils.dataloader import My_test_dataset  # Debe retornar (image, thermal, gt, name)
+from utils.dataloader import My_test_dataset  # Debe retornar (image, nir, gt, name)
 from lib.cod_net import CamouflageDetectionNet
 
 
@@ -27,19 +27,19 @@ def save_gray(path, tensor_1x1xHxW):
     cv2.imwrite(path, arr)
 
 
-def make_vis_grid(image, thermal, gt, pred,
+def make_vis_grid(image, nir, gt, pred,
                   rgb_stats=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
                   th_stats=((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))):
     """
-    Devuelve una imagen BGR concatenada horizontalmente: [RGB | Thermal | GT | Pred]
-    image, thermal: 1x3xHxW normalizados
+    Devuelve una imagen BGR concatenada horizontalmente: [RGB | nir | GT | Pred]
+    image, nir: 1x3xHxW normalizados
     gt, pred: 1x1xHxW en [0,1]
     """
     rgb_mean, rgb_std = rgb_stats
     th_mean, th_std = th_stats
 
     img_vis = denorm(image, rgb_mean, rgb_std)[0].permute(1, 2, 0).cpu().numpy()  # HxWx3 en [0,1]
-    th_vis = denorm(thermal, th_mean, th_std)[0].permute(1, 2, 0).cpu().numpy()   # HxWx3 en [0,1]
+    th_vis = denorm(nir, th_mean, th_std)[0].permute(1, 2, 0).cpu().numpy()   # HxWx3 en [0,1]
     gt_vis = (gt[0, 0].cpu().numpy() * 255).astype(np.uint8)                       # HxW
     pred_vis = (pred[0, 0].cpu().numpy() * 255).astype(np.uint8)                   # HxW
 
@@ -54,19 +54,17 @@ def make_vis_grid(image, thermal, gt, pred,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--testsize', type=int, default=385, help='testing size (debe coincidir con train)')
-    parser.add_argument('--pth_path', type=str, default='C:/Respaldo/Henry/Proyecto Camuflaje/Codigo/AGNet-main/model_pth/AGNet_IguanaDataset/Net_epoch_best.pth')
-    parser.add_argument('--dataset', type=str, default='M3FD')
-    parser.add_argument('--test_path', type=str, default='../../Datasets', help='raíz de datasets (coincidir mayúsculas/minúsculas)')
-    parser.add_argument('--save_vis', action='store_true', help='guardar grid RGB|Thermal|GT|Pred')
+    parser.add_argument('--testsize', type=int, default=416, help='testing size (debe coincidir con train)')
+    parser.add_argument('--pth_path', type=str, default='C:/Respaldo/Henry/Proyecto Camuflaje/Codigo/AVNet-v2-main/model_pth/AVNet-v2_WeedBanana/157_AVNet-v2-PVT.pth')
+    parser.add_argument('--dataset', type=str, default='WeedBanana')
+    parser.add_argument('--data_root', type=str, default='../../Datasets', help='raíz de datasets (coincidir mayúsculas/minúsculas)')
+    parser.add_argument('--save_vis', action='store_true', help='guardar grid RGB|NIR|GT|Pred')
     parser.add_argument('--vis_subdir', type=str, default='vis', help='subcarpeta para guardar visualizaciones')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    #data_path = os.path.join(args.data_root, args.dataset, 'test')
-    data_path = os.path.join(args.test_path, 'test')
-    
+    data_path = os.path.join(args.data_root, args.dataset, 'test')
     save_dir_root = f'./results/{os.path.basename(os.path.dirname(args.pth_path))}/{args.dataset}'
     os.makedirs(save_dir_root, exist_ok=True)
     if args.save_vis:
@@ -86,13 +84,13 @@ def main():
     # Rutas de test
     image_root = os.path.join(data_path, 'Imgs') + '/'
     gt_root = os.path.join(data_path, 'GT') + '/'
-    thermal_root = os.path.join(data_path, 'NIR') + '/'
-    print('Test roots:', image_root, gt_root, thermal_root)
+    nir_root = os.path.join(data_path, 'NIR') + '/'
+    print('Test roots:', image_root, gt_root, nir_root)
 
-    # Dataset de test: debe devolver (image, thermal, gt, name)
+    # Dataset de test: debe devolver (image, nir, gt, name)
     test_loader = My_test_dataset(
         image_root=image_root,
-        thermal_root=thermal_root,   # OJO: orden correcto
+        thermal_root=nir_root,   
         gt_root=gt_root,
         testsize=args.testsize
     )
@@ -101,14 +99,14 @@ def main():
     total_mae = 0.0
     for i in range(test_loader.size):
         with torch.no_grad():
-            image, thermal, gt, name = test_loader.load_data()  # image/thermal: 1x3xHxW, gt: 1x1xHxW
+            image, nir, gt, name = test_loader.load_data()  # image/nir: 1x3xHxW, gt: 1x1xHxW
             # A GPU
             image = image.to(device, non_blocking=True)
-            thermal = thermal.to(device, non_blocking=True)
+            nir = nir.to(device, non_blocking=True)
             gt = gt.to(device, non_blocking=True)
 
             # Forward
-            outs_list, out_single = model(image, thermal)
+            outs_list, out_single, edges = model(image, nir)
 
             # Reescalar a tamaño de GT
             target_size = gt.shape[-2:]
@@ -132,7 +130,7 @@ def main():
 
             # Visualización opcional
             if args.save_vis:
-                grid = make_vis_grid(image, thermal, gt, pred)
+                grid = make_vis_grid(image, nir, gt, pred)
                 cv2.imwrite(os.path.join(save_vis_dir, name), grid)
 
     avg_mae = total_mae / max(1, test_loader.size)
