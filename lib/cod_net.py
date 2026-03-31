@@ -1,29 +1,42 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mamba_ssm import Mamba
-#from huggingface_hub import hf_hub_download
-#import timm
+
 from lib.pvtv2 import pvt_v2_b2_
-from lib.pvtv2 import pvt_v2_b3_
-#from lib.smt import smt_t
 
+# =========================
+# BLOQUES BASE
+# =========================
 
-# Residual Block (Conv + InstanceNorm + LeakyReLU + Residual)
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.norm = nn.InstanceNorm2d(channels)
         self.act = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        residual = x
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
-        return x + residual
-  
+        return x + self.act(self.norm(self.conv(x)))
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.project = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.res1 = ResidualBlock(out_channels)
+        self.res2 = ResidualBlock(out_channels)
+
+    def forward(self, x):
+        x = self.project(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
+
+
+# =========================
+# ATENCIÓN CBAM
+# =========================
+
 #https://github.com/Jongchan/attention-module/blob/c06383c514ab0032d044cc6fcd8c8207ea222ea7/MODELS/cbam.py
 class BasicConv(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True, bn=True, bias=False):
@@ -116,225 +129,183 @@ class CBAM(nn.Module):
             x_out = self.SpatialGate(x_out)
         return x_out
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, mamba_dim: int = 64, use_mamba: bool = True, use_cbam: bool = True):
-        super().__init__()
-        self.project_in = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+# =========================
+# FUSIÓN RGB + TÉRMICA
+# =========================
 
-        self.res_block1 = ResidualBlock(out_channels)
-        self.res_block2 = ResidualBlock(out_channels)
-
-        self.layer_norm = nn.LayerNorm(out_channels)
-
-        # Branch 1
-        self.linear1_branch1 = nn.Linear(out_channels, out_channels)
-        self.conv1d_branch1 = nn.Conv1d(out_channels, out_channels, kernel_size=1)
-        self.act_branch1 = nn.SiLU()
-      
-        # Mamba
-        self.use_mamba = use_mamba
-        if self.use_mamba:
-            self.mamba = Mamba(d_model=out_channels, d_state=mamba_dim, d_conv=4, expand=2)
-
-        # Branch 2
-        self.linear1_branch2 = nn.Linear(out_channels, out_channels)
-        self.act_branch2 = nn.SiLU()
-
-        # Final projection
-        self.linear2 = nn.Linear(out_channels, out_channels)
-
-        # CBAM (opcional)
-        self.use_cbam = use_cbam
-        if self.use_cbam:
-            self.cbam = CBAM(out_channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, _, H, W = x.shape
-        # Step 0: Project input if in_channels != out_channels
-        x = self.project_in(x)
-
-        # Step 1: Two Residual Blocks
-        x = self.res_block1(x)
-        x = self.res_block2(x)
-
-        # Step 2: Flatten and Permute
-        x = x.flatten(2).transpose(1, 2)  # (B, L, C)
-        # Step 3: LayerNorm
-        x = self.layer_norm(x)
-
-        # Step 4: Split into two branches
-        # Branch 1
-        branch1 = self.linear1_branch1(x)
-        branch1 = branch1.transpose(1, 2)
-        branch1 = self.conv1d_branch1(branch1)
-        branch1 = branch1.transpose(1, 2)
-        branch1 = self.act_branch1(branch1)
-      
-        # Aplicar Mamba solo si está activo
-        if self.use_mamba:
-            branch1 = self.mamba(branch1)
-      
-        # Branch 2
-        branch2 = self.linear1_branch2(x)
-        branch2 = self.act_branch2(branch2)
-        # Step 5: Hadamard Product
-        x = branch1 * branch2
-        # Step 6: Linear Projection
-        x = self.linear2(x)
-        # Step 7: Reshape back
-        x = x.transpose(1, 2).view(B, -1, H, W)
-
-        # Aplicar CBAM solo si está activo
-        if self.use_cbam:
-            x = self.cbam(x)
-
-        return x
-
-
-# --- Feature Aggregation ---
 class FeatureAggregation(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.conv1x1 = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        self.conv3x3 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 1)
+        self.conv3 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
 
-    def forward(self, features):
-        x = torch.cat(features, dim=1)
-        x = self.conv1x1(x)
-        x = self.conv3x3(x)
-        return x
+    def forward(self, feats):
+        x = torch.cat(feats, dim=1)
+        return self.conv3(self.conv1(x))
 
-#Fusion Block
+
 class GatedFusion(nn.Module):
-    def __init__(self, channels, reduction=16):
+    def __init__(self, channels):
         super().__init__()
-        hidden = max(channels // reduction, 4)
-        self.rgb_gate = nn.Sequential(
+        self.gate_rgb = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, hidden, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, 1),
+            nn.Conv2d(channels, channels, 1),
             nn.Sigmoid()
         )
-        self.th_gate = nn.Sequential(
+        self.gate_th = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, hidden, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, 1),
+            nn.Conv2d(channels, channels, 1),
             nn.Sigmoid()
         )
-        self.fuse = FeatureAggregation(channels * 2, channels)
+        # Agregamos CBAM después de la concatenación/fusión
+        self.fuse = nn.Conv2d(channels * 2, channels, 1)
+        self.cbam = CBAM(channels) 
 
-    def forward(self, rgb_feat, thermal_feat):
-        rgb_mask = self.rgb_gate(rgb_feat)
-        th_mask = self.th_gate(thermal_feat)
-        gated_rgb = rgb_feat * rgb_mask
-        gated_th = thermal_feat * th_mask
-        return self.fuse([gated_rgb, gated_th])
+    def forward(self, rgb, th):
+        rgb_att = rgb * self.gate_rgb(rgb)
+        th_att = th * self.gate_th(th)
+        fused = self.fuse(torch.cat([rgb_att, th_att], dim=1))
+        return self.cbam(fused)
         
-# --- Decoder Block ---
+# =========================
+# DECODER
+# =========================
+
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels):
+    def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.aggr = FeatureAggregation(in_channels + skip_channels, out_channels)
-        self.conv_block = ConvBlock(out_channels, out_channels)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.aggr = FeatureAggregation(in_ch + skip_ch, out_ch)
+        self.conv = ConvBlock(out_ch, out_ch)
 
-    def forward(self, x, skips):
-        x = self.upsample(x)
-        skips = [F.interpolate(feat, size=x.shape[2:], mode='bilinear', align_corners=False) for feat in skips]
-        x = self.aggr([x] + skips)
-        x = self.conv_block(x)
-        return x
+    def forward(self, x, skip):
+        x = self.up(x)
+        skip = F.interpolate(skip, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x = self.aggr([x, skip])
+        return self.conv(x)
 
 
-# --- Modelo Completo ---
+# =========================
+# CONTORNOS (EDGE HEAD)
+# =========================
+
+class EdgeHead(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(in_channels // 2, in_channels // 4, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(in_channels // 4, 1, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class BoundaryRefinement(nn.Module):
+    def forward(self, seg, edge):
+        return seg * (1 + torch.sigmoid(edge))
+
+
+# =========================
+# MODELO COMPLETO
+# =========================
+
 class CamouflageDetectionNet(nn.Module):
     def __init__(self, features=[64, 128, 256, 512], pretrained=True):
         super().__init__()
+
         self.backbone = pvt_v2_b2_()
-      
         if pretrained:
-            #self._load_backbone_weights('C:/Respaldo/Henry/Proyecto Camuflaje/Codigo/AGNet-main/pretrained_pvt/pvt_v2_b2.pth')
-            self._load_backbone_weights('/kaggle/input/pretrained_pvt_v2_b2/pytorch/default/1/pvt_v2_b2.pth')
-            
+            self._load_backbone_weights(
+                "C:/Respaldo/Henry/Proyecto Camuflaje/Codigo/AVNet-v2-main/pretrained_pvt/pvt_v2_b2.pth"
+            )
 
-        out_channels = [64, 128, 320, 512] 
+        backbone_ch = [64, 128, 320, 512]
 
-        # Modificar los encoders para aceptar 4 canales (RGB + Térmica)
-        self.rgb_encoder = nn.ModuleList([
-            ConvBlock(out_channels[i], features[i]) for i in range(4)
+        self.rgb_enc = nn.ModuleList([
+            ConvBlock(backbone_ch[i], features[i]) for i in range(4)
         ])
-        self.thermal_encoder = nn.ModuleList([
-            ConvBlock(out_channels[i], features[i]) for i in range(4)
+        self.th_enc = nn.ModuleList([
+            ConvBlock(backbone_ch[i], features[i]) for i in range(4)
         ])
 
-        # Bloque de fusión para combinar características RGB y térmicas
-        self.fusion_blocks = nn.ModuleList([
+        self.fusions = nn.ModuleList([
             GatedFusion(features[i]) for i in range(4)
         ])
 
-        self.decoder3 = DecoderBlock(features[3], features[2], features[2])
-        self.decoder2 = DecoderBlock(features[2], features[1], features[1])
-        self.decoder1 = DecoderBlock(features[1], features[0], features[0])
+        self.dec3 = DecoderBlock(features[3], features[2], features[2])
+        self.dec2 = DecoderBlock(features[2], features[1], features[1])
+        self.dec1 = DecoderBlock(features[1], features[0], features[0])
 
-        self.final_decoder = ConvBlock(features[0], features[0])
-
-        self.seg_heads = nn.ModuleList([
-            nn.Conv2d(features[2], 1, kernel_size=1),
-            nn.Conv2d(features[1], 1, kernel_size=1),
-            nn.Conv2d(features[0], 1, kernel_size=1),
-            nn.Conv2d(features[0], 1, kernel_size=1),
-        ])
-  
-    def forward(self, x_rgb: torch.Tensor, x_thermal: torch.Tensor):
-        # Backbone features para RGB y Térmica
-        rgb_skips = self.backbone.forward_features(x_rgb)
-        thermal_skips = self.backbone.forward_features(x_thermal)
-
-        # Extraer características con los encoders
-        rgb_feats = [enc(skip) for enc, skip in zip(self.rgb_encoder, rgb_skips)]
-        thermal_feats = [enc(skip) for enc, skip in zip(self.thermal_encoder, thermal_skips)]
-
-        # Fusionar características RGB y térmicas
-        #fused_feats = [fusion([rgb, thermal]) for fusion, rgb, thermal in zip(self.fusion_blocks, rgb_feats, thermal_feats)]
-        fused_feats = [
-            fusion(rgb, thermal)
-            for fusion, rgb, thermal in zip(self.fusion_blocks, rgb_feats, thermal_feats)
-        ]
-        
-        # Decoder path
-        d3 = self.decoder3(fused_feats[3], [fused_feats[2]])
-        d2 = self.decoder2(d3, [fused_feats[1]])
-        d1 = self.decoder1(d2, [fused_feats[0]])
-
-        d0 = self.final_decoder(d1)
+        self.final_conv = ConvBlock(features[0], features[0])
 
         # Deep supervision
-        out3 = F.interpolate(self.seg_heads[0](d3), size=x_rgb.shape[2:], mode='bilinear', align_corners=False)
-        out2 = F.interpolate(self.seg_heads[1](d2), size=x_rgb.shape[2:], mode='bilinear', align_corners=False)
-        out1 = F.interpolate(self.seg_heads[2](d1), size=x_rgb.shape[2:], mode='bilinear', align_corners=False)
-        out0 = F.interpolate(self.seg_heads[3](d0), size=x_rgb.shape[2:], mode='bilinear', align_corners=False)
+        self.seg_heads = nn.ModuleList([
+            nn.Conv2d(features[2], 1, 1),
+            nn.Conv2d(features[1], 1, 1),
+            nn.Conv2d(features[0], 1, 1),
+            nn.Conv2d(features[0], 1, 1),
+        ])
+
+        # Contornos
+        self.edge_head = EdgeHead(features[0])
+        self.boundary_refine = BoundaryRefinement()
+
+    def forward(self, x_rgb, x_th):
+        rgb_feats = self.backbone.forward_features(x_rgb)
+        th_feats = self.backbone.forward_features(x_th)
+
+        rgb_feats = [e(f) for e, f in zip(self.rgb_enc, rgb_feats)]
+        th_feats = [e(f) for e, f in zip(self.th_enc, th_feats)]
+
+        fused = [f(r, t) for f, r, t in zip(self.fusions, rgb_feats, th_feats)]
+
+        d3 = self.dec3(fused[3], fused[2])
+        d2 = self.dec2(d3, fused[1])
+        d1 = self.dec1(d2, fused[0])
+
+        d0 = self.final_conv(d1)
+
+        # Segmentaciones intermedias
+        out3 = F.interpolate(self.seg_heads[0](d3), x_rgb.shape[2:], mode='bilinear', align_corners=False)
+        out2 = F.interpolate(self.seg_heads[1](d2), x_rgb.shape[2:], mode='bilinear', align_corners=False)
+        out1 = F.interpolate(self.seg_heads[2](d1), x_rgb.shape[2:], mode='bilinear', align_corners=False)
+        out0 = F.interpolate(self.seg_heads[3](d0), x_rgb.shape[2:], mode='bilinear', align_corners=False)
 
         final_out = (out0 + out1 + out2 + out3) / 4
-        
-        return [out0, out1, out2, out3], final_out
- 
-    def _load_backbone_weights(self, path: str):
+
+        # Contornos
+        edge = self.edge_head(d0)
+        edge = F.interpolate(edge, x_rgb.shape[2:], mode='bilinear', align_corners=False)
+
+        # Refinamiento
+        final_out = self.boundary_refine(final_out, edge)
+
+        return [out0, out1, out2, out3], final_out, edge
+
+    def _load_backbone_weights(self, path):
         try:
-            state_dict = torch.load(path, map_location='cpu')
-            self.backbone.load_state_dict(state_dict, strict=False)
-            print("✅ Pesos backbone cargados correctamente.")
+            self.backbone.load_state_dict(torch.load(path, map_location='cpu'), strict=False)
+            print("✅ Backbone cargado")
         except Exception as e:
-            print(f"❌ Error cargando pesos backbone: {e}")
+            print("❌ Error:", e)
 
 
-# Ejemplo de uso optimizado
+# =========================
+# TEST RÁPIDO
+# =========================
+
 if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = CamouflageDetectionNet(pretrained=True).to(device)
-    model.eval()
-    with torch.no_grad():
-        x = torch.randn(1, 3, 256, 256).to(device)
-        outputs, final_output = model(x)
-        print(final_output.shape)  # [1, 1, 256, 256]
+    model = CamouflageDetectionNet().cuda()
+    x = torch.randn(1, 3, 256, 256).cuda()
+    y = torch.randn(1, 3, 256, 256).cuda()
+
+    outs, mask, edge = model(x, y)
+    print(mask.shape, edge.shape)
