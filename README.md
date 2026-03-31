@@ -3,7 +3,7 @@
 # Architecture
 Overall proposed architecture.
 
-![pipeline](AVNet.png) <br>
+![pipeline](SWNet_architecture.pdf) <br>
 
 
 # Citation
