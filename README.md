@@ -6,6 +6,8 @@ Overall proposed architecture.
 
 ![pipeline](SWNet.png) <br>
 
+# Dataset
+https://www.kaggle.com/datasets/hvelesaca/weedbananacod
 
 # Citation
 If you use the SWNet, please cite the following paper
