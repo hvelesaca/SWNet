@@ -9,8 +9,8 @@ Overall proposed architecture.
 # Dataset
 https://www.kaggle.com/datasets/hvelesaca/weedbananacod
 
-# Eval
-You can use this script eval_[weedBanana_swnet.py](evaluation script)  to evaluate the mask results that is in folder [results/WeedsBanana](results).
+# Evaluation resources
+You can use this script [eval_weedBanana_swnet.py](evaluation script)  to evaluate the mask results that are in the folder [results/WeedsBanana](results).
  
 # Citation
 If you use the SWNet, please cite the following paper
